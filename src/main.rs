@@ -35,9 +35,11 @@ struct Args {
     #[arg(long, value_name = "GLOB")]
     exclude: Vec<String>,
 
-    /// Write the paths of skipped empty (0-byte) files to this file.
-    #[arg(long, value_name = "FILE")]
-    log: Option<PathBuf>,
+    /// Write a full report (duplicate groups and skipped empty files) to a file.
+    /// Given without a value, drops it at <PATH>/tcobo.log; pass an explicit
+    /// path with `--log=<FILE>`.
+    #[arg(long, value_name = "FILE", num_args = 0..=1, require_equals = true)]
+    log: Option<Option<PathBuf>>,
 
     /// Generate a shell completion script to stdout and exit.
     #[arg(long, value_name = "SHELL")]
@@ -78,11 +80,17 @@ fn main() -> Result<(), Error> {
     let candidates: usize = size_buckets.values().filter(|v| v.len() > 1).map(Vec::len).sum();
     output::print_scan_start(scanned, candidates, empties.len());
 
-    if let Some(log_path) = &args.log {
-        output::write_empty_log(log_path, &empties)?;
-    }
-
     let groups = assemble_groups(confirm_by_full_hash(chunk_hash(size_buckets)));
+
+    // `--log` with no value defaults to <scanned path>/tcobo.log.
+    let log_path = match &args.log {
+        Some(Some(file)) => Some(file.clone()),
+        Some(None) => Some(path.join("tcobo.log")),
+        None => None,
+    };
+    if let Some(log_path) = &log_path {
+        output::write_log(log_path, scanned, candidates, started.elapsed(), &groups, &empties)?;
+    }
 
     if args.json {
         output::print_json(scanned, candidates, empties.len(), started.elapsed(), &groups)?;

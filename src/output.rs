@@ -56,32 +56,68 @@ pub fn print_scan_start(scanned: usize, candidates: usize, empty_count: usize) {
     }
 }
 
-/// Write the paths of skipped empty files to `path` (with a header), and note
-/// on stderr where they went.
-pub fn write_empty_log(path: &Path, empties: &[PathBuf]) -> io::Result<()> {
-    let mut log = File::create(path)?;
-    writeln!(
-        log,
-        "# {} empty (0-byte) file(s) — trivially identical, excluded from hashing.",
-        empties.len()
-    )?;
-    for empty in empties {
-        writeln!(log, "{}", empty.display())?;
-    }
-    if !empties.is_empty() {
-        eprintln!("Wrote {} empty-file path(s) to {}.", empties.len(), path.display());
+/// Write duplicate groups as a text listing to `w`.
+fn write_groups<W: Write>(w: &mut W, groups: &[DupGroup]) -> io::Result<()> {
+    for group in groups {
+        writeln!(w, "Duplicates ({} bytes each):", group.size)?;
+        for path in &group.paths {
+            writeln!(w, "  {}", path.display())?;
+        }
     }
     Ok(())
 }
 
 /// Print duplicate groups as a human-readable listing on stdout.
 pub fn print_text(groups: &[DupGroup]) {
-    for group in groups {
-        println!("Duplicates ({} bytes each):", group.size);
-        for path in &group.paths {
-            println!("  {}", path.display());
+    // Writing to stdout only fails on a broken pipe, where exiting is fine.
+    let _ = write_groups(&mut io::stdout().lock(), groups);
+}
+
+/// Write a full report to `path` — a summary header, the duplicate groups, and
+/// the skipped empty files — and note on stderr where it went.
+pub fn write_log(
+    path: &Path,
+    scanned: usize,
+    candidates: usize,
+    elapsed: Duration,
+    groups: &[DupGroup],
+    empties: &[PathBuf],
+) -> io::Result<()> {
+    let mut log = File::create(path)?;
+    writeln!(log, "# tcobo duplicate report")?;
+    writeln!(
+        log,
+        "# scanned {scanned} file(s); {candidates} hashed; {} group(s) spanning {} file(s); \
+         {} reclaimable; {} empty; {:.2?} elapsed",
+        groups.len(),
+        duplicate_files(groups),
+        human_readable_bytes(reclaimable_bytes(groups)),
+        empties.len(),
+        elapsed,
+    )?;
+
+    writeln!(log)?;
+    write_groups(&mut log, groups)?;
+
+    if !empties.is_empty() {
+        writeln!(log)?;
+        writeln!(
+            log,
+            "# {} empty (0-byte) file(s) — trivially identical, excluded from hashing.",
+            empties.len()
+        )?;
+        for empty in empties {
+            writeln!(log, "{}", empty.display())?;
         }
     }
+
+    eprintln!(
+        "Wrote report to {} ({} group(s), {} empty file(s)).",
+        path.display(),
+        groups.len(),
+        empties.len()
+    );
+    Ok(())
 }
 
 /// Serialize the full report as pretty JSON on stdout.
