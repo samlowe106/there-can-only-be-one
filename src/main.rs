@@ -1,90 +1,72 @@
-use anyhow::Error;
+use std::io;
 use std::path::PathBuf;
-use std::{
-    collections::HashMap,
-    fs::File,
-    io::{self, Read},
-    path::Path,
+
+use anyhow::Error;
+use clap::{CommandFactory, Parser};
+use clap_complete::Shell;
+
+use there_can_only_be_one::dedupe::{
+    assemble_groups, bucket_by_size, chunk_hash, confirm_by_full_hash,
 };
 
-use walkdir::WalkDir;
-
-use std::os::unix::fs::MetadataExt;
-
-use clap::Parser;
-
-#[derive(clap::Parser)]
+#[derive(Parser)]
+#[command(name = "tcobo", version, about = "Find duplicate files in a directory")]
 struct Args {
-    path: PathBuf,
+    /// Directory to scan for duplicates.
+    #[arg(required_unless_present_any = ["completions", "manpage"])]
+    path: Option<PathBuf>,
+
+    /// Generate a shell completion script to stdout and exit.
+    #[arg(long, value_name = "SHELL")]
+    completions: Option<Shell>,
+
+    /// Generate a man page (roff) to stdout and exit.
+    #[arg(long)]
+    manpage: bool,
 }
 
 fn main() -> Result<(), Error> {
     let args = Args::parse();
 
-    /*
-    let path: PathBuf = std::env::args()
-        .nth(1)
-        .expect("usage: dedupe <path>")
-        .into();
-    */
-
-    // bucket by size
-    let mut size_buckets: HashMap<u64, Vec<_>> = HashMap::new();
-    for entry in WalkDir::new(args.path) {
-        let entry = entry?;
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let size = entry.metadata()?.len();
-        size_buckets.entry(size).or_default().push(entry);
+    if let Some(shell) = args.completions {
+        let mut cmd = Args::command();
+        let name = cmd.get_name().to_string();
+        clap_complete::generate(shell, &mut cmd, name, &mut io::stdout());
+        return Ok(());
     }
 
-    // chunk-hash files that share a size
-    let mut buckets: HashMap<_, Vec<_>> = HashMap::new();
-    let mut hasher = blake3::Hasher::new();
-    for entries in size_buckets.values().filter(|v| v.len() > 1) {
-        for entry in entries {
-            let file_path = entry.path();
-            let chunk_size = determine_block_size(file_path);
-            let file = File::open(file_path)?;
-            hasher.reset();
-            let mut limited = file.take(chunk_size);
-            io::copy(&mut limited, &mut hasher)?;
-            buckets
-                .entry(hasher.finalize())
-                .or_insert_with(Vec::new)
-                .push(entry);
-        }
+    if args.manpage {
+        clap_mangen::Man::new(Args::command()).render(&mut io::stdout())?;
+        return Ok(());
     }
 
-    let mut duplicates: HashMap<_, Vec<_>> = HashMap::new();
+    // Guaranteed present by `required_unless_present_any`.
+    let path = args.path.expect("path is required");
 
-    for entries in buckets.values().filter(|v| v.len() > 1) {
-        for entry in entries {
-            let mut file = File::open(entry.path())?;
-            hasher.reset();
-            io::copy(&mut file, &mut hasher)?; // no .take() — full file
-            duplicates.entry(hasher.finalize()).or_default().push(entry);
+    // Progress goes to stderr so the duplicate listing on stdout stays clean
+    // and pipeable. This tool only reads and reports — it never deletes.
+    eprintln!("Scanning {}...", path.display());
+    let size_buckets = bucket_by_size(&path);
+    let scanned: usize = size_buckets.values().map(Vec::len).sum();
+    let candidates: usize = size_buckets.values().filter(|v| v.len() > 1).map(Vec::len).sum();
+    eprintln!("Found {scanned} file(s); {candidates} share a size and will be hashed.");
+
+    let groups = assemble_groups(confirm_by_full_hash(chunk_hash(size_buckets)));
+
+    let mut reclaimable = 0u64;
+    for group in &groups {
+        // Keeping one copy, the rest are reclaimable.
+        reclaimable += group.size * (group.paths.len() as u64 - 1);
+        println!("Duplicates ({} bytes each):", group.size);
+        for path in &group.paths {
+            println!("  {}", path.display());
         }
     }
 
-    // duplicates now maps full-file hash -> Vec of paths that are truly identical
-    for entries in duplicates.values().filter(|v| v.len() > 1) {
-        println!("Duplicates:");
-        for entry in entries {
-            println!("  {}", entry.path().display());
-        }
-    }
+    eprintln!(
+        "Done: {} duplicate group(s); {reclaimable} bytes reclaimable (nothing deleted).",
+        groups.len(),
+    );
 
     Ok(())
-}
-
-fn determine_block_size(path: &Path) -> u64 {
-    const MAX_CHUNK: u64 = 65_536; // 64 KiB ceiling
-    const DEFAULT: u64 = 4096;
-
-    // feels weird to use a map on just one item
-    std::fs::metadata(path)
-        .map(|m| m.blksize().min(MAX_CHUNK))
-        .unwrap_or(DEFAULT)
 }
