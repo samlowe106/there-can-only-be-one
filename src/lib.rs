@@ -4,3 +4,5 @@
 //! wraps it in a command-line interface.
 
 pub mod dedupe;
+pub mod output;
+mod platform;

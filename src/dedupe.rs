@@ -6,16 +6,22 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+use globset::GlobSet;
 use rayon::prelude::*;
 use walkdir::{DirEntry, WalkDir};
 
-/// 64 KiB ceiling on the amount of a file sampled during the chunk-hash pass.
-const MAX_CHUNK: u64 = 65_536;
-/// Fallback chunk size when a filesystem reports no sensible block size.
-const DEFAULT_CHUNK: u64 = 4096;
+use crate::platform::{self, PhysicalId};
+
+/// Key used to collapse hardlinks during the walk: files sharing a physical
+/// identity dedup to one entry, while files with no available identity each get
+/// a distinct key and are all kept.
+#[derive(PartialEq, Eq, Hash)]
+enum FileKey {
+    Physical(PhysicalId),
+    Distinct(usize),
+}
 
 /// A candidate file, carrying the metadata we gathered during the walk so we
 /// never have to `stat` it again.
@@ -26,6 +32,38 @@ pub struct FileInfo {
     path: PathBuf,
     size: u64,
     chunk_size: u64,
+}
+
+impl FileInfo {
+    /// The path to this file.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Consume this `FileInfo`, returning its path.
+    pub fn into_path(self) -> PathBuf {
+        self.path
+    }
+}
+
+/// Options controlling the filesystem walk in [`bucket_by_size`].
+pub struct WalkOptions {
+    /// Follow symbolic links while walking (default: `false`).
+    pub follow_symlinks: bool,
+    /// Ignore files smaller than this many bytes (default: `0`).
+    pub min_size: u64,
+    /// Skip any path matching this glob set (default: matches nothing).
+    pub exclude: GlobSet,
+}
+
+impl Default for WalkOptions {
+    fn default() -> Self {
+        Self {
+            follow_symlinks: false,
+            min_size: 0,
+            exclude: GlobSet::empty(),
+        }
+    }
 }
 
 /// A group of files that are byte-for-byte identical.
@@ -40,28 +78,58 @@ pub struct DupGroup {
 ///
 /// Unreadable files and directory-walk errors are reported to stderr and
 /// skipped rather than aborting the whole scan.
-pub fn find_duplicates(root: &Path) -> Vec<DupGroup> {
-    let size_buckets = bucket_by_size(root);
+pub fn find_duplicates(root: &Path, opts: &WalkOptions) -> Vec<DupGroup> {
+    let size_buckets = bucket_by_size(root, opts);
     let chunk_buckets = chunk_hash(size_buckets);
     let by_hash = confirm_by_full_hash(chunk_buckets);
     assemble_groups(by_hash)
 }
 
-/// Pass 1: walk `root` and bucket files by size.
+/// Remove and return the paths of empty (0-byte) files from `size_buckets`.
 ///
-/// Hardlinks are deduplicated by collecting into a map keyed by (device,
-/// inode): only one name survives per physical file, so we never report two
-/// names for the same bytes (which waste no disk). Walk errors and unreadable
-/// files are logged and skipped.
-pub fn bucket_by_size(root: &Path) -> HashMap<u64, Vec<FileInfo>> {
+/// Empty files are trivially identical, so callers usually set them aside and
+/// report them separately rather than hashing them into one giant group.
+pub fn take_empty_files(size_buckets: &mut HashMap<u64, Vec<FileInfo>>) -> Vec<PathBuf> {
+    size_buckets
+        .remove(&0)
+        .unwrap_or_default()
+        .into_iter()
+        .map(FileInfo::into_path)
+        .collect()
+}
+
+/// Total bytes reclaimable by keeping a single copy of each duplicate group.
+pub fn reclaimable_bytes(groups: &[DupGroup]) -> u64 {
+    groups.iter().map(|g| g.size * (g.paths.len() as u64 - 1)).sum()
+}
+
+/// Total number of files spanned by all duplicate groups.
+pub fn duplicate_files(groups: &[DupGroup]) -> usize {
+    groups.iter().map(|g| g.paths.len()).sum()
+}
+
+/// Pass 1: walk `root` and bucket files by size, honoring `opts` (symlink
+/// following, minimum size, and exclude globs).
+///
+/// Hardlinks are deduplicated by collecting into a map keyed by physical
+/// identity (see [`crate::platform`]): only one name survives per physical
+/// file, so we never report two names for the same bytes (which waste no
+/// disk). Walk errors and unreadable files are logged and skipped.
+pub fn bucket_by_size(root: &Path, opts: &WalkOptions) -> HashMap<u64, Vec<FileInfo>> {
     WalkDir::new(root)
+        .follow_links(opts.follow_symlinks)
         .into_iter()
         .filter_map(|entry| entry.map_err(|e| eprintln!("warning: {e}")).ok())
         .filter(|entry| entry.file_type().is_file())
+        .filter(|entry| !opts.exclude.is_match(entry.path()))
         .filter_map(file_info)
-        // Collecting into a map keyed by (device, inode) keeps one name per
-        // physical file, dropping hardlinks.
-        .collect::<HashMap<(u64, u64), FileInfo>>()
+        .filter(|(_, info)| info.size >= opts.min_size)
+        // Collecting into a map keyed by physical identity keeps one name per
+        // physical file, dropping hardlinks. Files without an identity get a
+        // distinct key so they're all retained.
+        .enumerate()
+        .map(|(i, (id, info))| (id.map_or(FileKey::Distinct(i), FileKey::Physical), info))
+        .collect::<HashMap<FileKey, FileInfo>>()
         .into_values()
         .fold(HashMap::new(), |mut buckets, info| {
             buckets.entry(info.size).or_default().push(info);
@@ -69,25 +137,21 @@ pub fn bucket_by_size(root: &Path) -> HashMap<u64, Vec<FileInfo>> {
         })
 }
 
-/// Read the metadata for one walked file and build its [`FileInfo`], keyed by
-/// its (device, inode) so callers can deduplicate hardlinks. Returns `None`
-/// (after logging) if the file cannot be `stat`ed.
-fn file_info(entry: DirEntry) -> Option<((u64, u64), FileInfo)> {
+/// Read the metadata for one walked file and build its [`FileInfo`], paired
+/// with its physical identity (if the platform provides one) for hardlink
+/// dedup. Returns `None` (after logging) if the file cannot be `stat`ed.
+fn file_info(entry: DirEntry) -> Option<(Option<PhysicalId>, FileInfo)> {
     let meta = entry
         .metadata()
         .map_err(|e| eprintln!("warning: cannot stat {}: {e}", entry.path().display()))
         .ok()?;
-    let chunk_size = if meta.blksize() == 0 {
-        DEFAULT_CHUNK
-    } else {
-        meta.blksize().min(MAX_CHUNK)
-    };
+    let id = platform::physical_id(&meta);
     let info = FileInfo {
-        path: entry.into_path(),
+        chunk_size: platform::chunk_size(&meta),
         size: meta.len(),
-        chunk_size,
+        path: entry.into_path(),
     };
-    Some(((meta.dev(), meta.ino()), info))
+    Some((id, info))
 }
 
 /// Pass 2: chunk-hash every file that shares its size with another, in
