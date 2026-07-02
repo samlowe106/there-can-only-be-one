@@ -8,7 +8,8 @@ use clap_complete::Shell;
 use globset::{Glob, GlobSetBuilder};
 
 use there_can_only_be_one::dedupe::{
-    assemble_groups, bucket_by_size, chunk_hash, confirm_by_full_hash, take_empty_files, WalkOptions,
+    WalkOptions, assemble_groups, bucket_by_size, chunk_hash, confirm_by_full_hash,
+    take_empty_files,
 };
 use there_can_only_be_one::output;
 
@@ -77,7 +78,11 @@ fn main() -> Result<(), Error> {
     // than hashing them and flooding the output with one giant group.
     let empties = take_empty_files(&mut size_buckets);
     let scanned = size_buckets.values().map(Vec::len).sum::<usize>() + empties.len();
-    let candidates: usize = size_buckets.values().filter(|v| v.len() > 1).map(Vec::len).sum();
+    let candidates: usize = size_buckets
+        .values()
+        .filter(|v| v.len() > 1)
+        .map(Vec::len)
+        .sum();
     output::print_scan_start(scanned, candidates, empties.len());
 
     let groups = assemble_groups(confirm_by_full_hash(chunk_hash(size_buckets)));
@@ -89,11 +94,24 @@ fn main() -> Result<(), Error> {
         None => None,
     };
     if let Some(log_path) = &log_path {
-        output::write_log(log_path, scanned, candidates, started.elapsed(), &groups, &empties)?;
+        output::write_log(
+            log_path,
+            scanned,
+            candidates,
+            started.elapsed(),
+            &groups,
+            &empties,
+        )?;
     }
 
     if args.json {
-        output::print_json(scanned, candidates, empties.len(), started.elapsed(), &groups)?;
+        output::print_json(
+            scanned,
+            candidates,
+            empties.len(),
+            started.elapsed(),
+            &groups,
+        )?;
     } else {
         output::print_text(&groups);
     }

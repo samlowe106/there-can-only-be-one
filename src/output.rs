@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::dedupe::{duplicate_files, reclaimable_bytes, DupGroup};
+use crate::dedupe::{DupGroup, duplicate_files, reclaimable_bytes};
 
 /// The JSON report emitted by [`print_json`].
 #[derive(Serialize)]
@@ -139,7 +139,11 @@ pub fn print_json(
             .iter()
             .map(|g| Group {
                 size: g.size,
-                paths: g.paths.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
+                paths: g
+                    .paths
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect(),
             })
             .collect(),
     };

@@ -5,8 +5,8 @@ use std::path::Path;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use tempfile::tempdir;
 use there_can_only_be_one::dedupe::{
-    assemble_groups, bucket_by_size, chunk_hash, confirm_by_full_hash, duplicate_files,
-    find_duplicates, reclaimable_bytes, take_empty_files, DupGroup, FileInfo, WalkOptions,
+    DupGroup, FileInfo, WalkOptions, assemble_groups, bucket_by_size, chunk_hash,
+    confirm_by_full_hash, duplicate_files, find_duplicates, reclaimable_bytes, take_empty_files,
 };
 
 // ---- helpers ---------------------------------------------------------------
@@ -204,7 +204,10 @@ fn exclude_glob_skips_matching_paths() {
 
     // The excluded copy is never scanned, so only the two kept files group.
     assert_eq!(groups.len(), 1);
-    assert_eq!(names(&groups), vec![vec!["keep_a".to_string(), "keep_b".to_string()]]);
+    assert_eq!(
+        names(&groups),
+        vec![vec!["keep_a".to_string(), "keep_b".to_string()]]
+    );
 }
 
 // ---- symlink policy --------------------------------------------------------
@@ -335,7 +338,13 @@ fn assemble_groups_drops_singletons_and_orders_by_size() {
     // Singletons gone; groups ordered largest-first; paths sorted within.
     assert_eq!(groups.len(), 2);
     assert_eq!(groups[0].size, 300);
-    assert_eq!(names(&groups)[0], vec!["big_a".to_string(), "big_b".to_string()]);
+    assert_eq!(
+        names(&groups)[0],
+        vec!["big_a".to_string(), "big_b".to_string()]
+    );
     assert_eq!(groups[1].size, 2);
-    assert_eq!(names(&groups)[1], vec!["small_a".to_string(), "small_b".to_string()]);
+    assert_eq!(
+        names(&groups)[1],
+        vec!["small_a".to_string(), "small_b".to_string()]
+    );
 }

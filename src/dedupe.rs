@@ -100,7 +100,10 @@ pub fn take_empty_files(size_buckets: &mut HashMap<u64, Vec<FileInfo>>) -> Vec<P
 
 /// Total bytes reclaimable by keeping a single copy of each duplicate group.
 pub fn reclaimable_bytes(groups: &[DupGroup]) -> u64 {
-    groups.iter().map(|g| g.size * (g.paths.len() as u64 - 1)).sum()
+    groups
+        .iter()
+        .map(|g| g.size * (g.paths.len() as u64 - 1))
+        .sum()
 }
 
 /// Total number of files spanned by all duplicate groups.
@@ -223,7 +226,11 @@ pub fn assemble_groups(by_hash: HashMap<blake3::Hash, Vec<FileInfo>>) -> Vec<Dup
             }
         })
         .collect();
-    groups.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.paths[0].cmp(&b.paths[0])));
+    groups.sort_by(|a, b| {
+        b.size
+            .cmp(&a.size)
+            .then_with(|| a.paths[0].cmp(&b.paths[0]))
+    });
     groups
 }
 
