@@ -6,13 +6,15 @@
 use std::fs::Metadata;
 
 /// 64 KiB ceiling on the amount of a file sampled during the chunk-hash pass.
+/// Only used where a filesystem block size is available to cap (Unix).
+#[cfg(unix)]
 pub const MAX_CHUNK: u64 = 65_536;
 /// Fallback chunk size when a filesystem reports no sensible block size, or on
 /// platforms that don't expose one.
 pub const DEFAULT_CHUNK: u64 = 4096;
 
 /// A stable identity for a physical file, used to deduplicate hardlinks.
-/// On Unix this is `(device, inode)`; on Windows, `(volume serial, file index)`.
+/// On Unix this is `(device, inode)`.
 pub type PhysicalId = (u64, u64);
 
 /// Number of leading bytes to sample when chunk-hashing this file.
@@ -39,15 +41,18 @@ pub fn physical_id(meta: &Metadata) -> Option<PhysicalId> {
     Some((meta.dev(), meta.ino()))
 }
 
-#[cfg(windows)]
-pub fn physical_id(meta: &Metadata) -> Option<PhysicalId> {
-    use std::os::windows::fs::MetadataExt;
-    // Both are populated only when the metadata came from an open handle;
-    // `walkdir` opens one, but fall back gracefully if they're missing.
-    Some((u64::from(meta.volume_serial_number()?), meta.file_index()?))
-}
-
-#[cfg(not(any(unix, windows)))]
+// Windows exposes file identity only through the still-unstable
+// `windows_by_handle` feature (`Metadata::volume_serial_number`/`file_index`),
+// so on stable we'd have to open each file by handle via the Win32 API to read
+// it. Until that's worth the cost, non-Unix platforms skip hardlink dedup and
+// keep every name (the `None` case in `bucket_by_size`).
+//
+// NOTE: we previously used those two methods here and it broke the Windows
+// build (they require nightly). Revisit when `windows_by_handle` stabilizes
+// (tracking issue: https://github.com/rust-lang/rust/issues/63010) — at that
+// point this can return `Some((volume_serial_number, file_index))` and Windows
+// gets hardlink dedup for free.
+#[cfg(not(unix))]
 pub fn physical_id(_meta: &Metadata) -> Option<PhysicalId> {
     None
 }

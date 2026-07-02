@@ -150,6 +150,9 @@ fn bucket_by_size_collects_empty_files_under_the_zero_key() {
     assert_eq!(buckets[&1].len(), 1);
 }
 
+// Hardlink dedup relies on a physical-file identity, which only Unix provides
+// on stable Rust (see `platform::physical_id`).
+#[cfg(unix)]
 #[test]
 fn bucket_by_size_deduplicates_hardlinks() {
     let dir = tempdir().unwrap();

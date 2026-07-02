@@ -34,10 +34,10 @@ Duplicate checking happens in multiple passes. First, all files in the directory
 
 From there, any hash collisions are inspected by fully hashing all colliding files. Any files whose hashes collide are reported as a group as duplicates. Files small enough to have been read in full during the sampling pass reuse that hash instead of being read again.
 
-Hashing runs in parallel across files ([rayon](https://github.com/rayon-rs/rayon)). Hardlinks are deduplicated by `(device, inode)` so multiple names for the same physical file are not reported as duplicates. Unreadable files and directory-walk errors are logged to stderr and skipped rather than aborting the scan.
+Hashing runs in parallel across files ([rayon](https://github.com/rayon-rs/rayon)). On Unix, hardlinks are deduplicated by `(device, inode)` so multiple names for the same physical file are not reported as duplicates; on other platforms this identity isn't available on stable Rust, so hardlink dedup is skipped there. Unreadable files and directory-walk errors are logged to stderr and skipped rather than aborting the scan.
 
 ## TODOs
 
 1. **Opt-in delete mode.** Add an action to reclaim space (delete redundant copies, or replace them with hard/symlinks), with report-only remaining the default and deletion gated behind an explicit flag plus a keep-policy for which copy survives. (This subsumes the old "dry run mode" idea — the tool is already effectively a dry run today.)
-2. **Cross-platform support.** The scan currently relies on `std::os::unix::fs::MetadataExt`, so it is Unix-only. The block-size sampling just needs a non-Unix fallback, but the bigger piece is the hardlink dedup, which keys on `(device, inode)` — Windows needs file IDs (`GetFileInformationByHandle`) or to skip inode-dedup there.
+2. **Windows hardlink dedup.** The tool now builds and runs cross-platform, but hardlink dedup is Unix-only: reading a file's identity on Windows needs `Metadata::volume_serial_number`/`file_index`, which are gated behind the still-unstable `windows_by_handle` feature ([rust-lang/rust#63010](https://github.com/rust-lang/rust/issues/63010)). We tried using them and it broke the Windows build (nightly-only), so `platform::physical_id` returns `None` off-Unix for now. Revisit when that feature stabilizes (then Windows gets dedup for free), or implement it via `GetFileInformationByHandle` if it's needed sooner.
 3. *(Low priority)* Optionally skip the chunk-hash pass and hash candidates in full directly — marginally faster only when most same-size files are genuine duplicates.
