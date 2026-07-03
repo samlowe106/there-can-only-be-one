@@ -5,7 +5,7 @@ use std::path::Path;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use tempfile::tempdir;
 use there_can_only_be_one::dedupe::{
-    DupGroup, FileInfo, WalkOptions, assemble_groups, bucket_by_size, chunk_hash,
+    DupGroup, FileInfo, Sample, ScanOptions, assemble_groups, bucket_by_size, chunk_hash,
     confirm_by_full_hash, duplicate_files, find_duplicates, reclaimable_bytes, take_empty_files,
 };
 
@@ -18,12 +18,12 @@ fn write(dir: &Path, name: &str, contents: &[u8]) {
 
 /// Bucket `dir` by size with default options.
 fn buckets(dir: &Path) -> HashMap<u64, Vec<FileInfo>> {
-    bucket_by_size(dir, &WalkOptions::default())
+    bucket_by_size(dir, &ScanOptions::default())
 }
 
 /// Find duplicates in `dir` with default options.
 fn dups(dir: &Path) -> Vec<DupGroup> {
-    find_duplicates(dir, &WalkOptions::default())
+    find_duplicates(dir, &ScanOptions::default())
 }
 
 /// Build a glob set from patterns.
@@ -177,7 +177,7 @@ fn min_size_skips_small_files() {
     write(dir.path(), "big_a", &[b'A'; 100]); // size 100 duplicate pair
     write(dir.path(), "big_b", &[b'A'; 100]);
 
-    let opts = WalkOptions {
+    let opts = ScanOptions {
         min_size: 50,
         ..Default::default()
     };
@@ -196,7 +196,7 @@ fn exclude_glob_skips_matching_paths() {
     fs::create_dir(dir.path().join("skip")).unwrap();
     write(&dir.path().join("skip"), "dup", b"same"); // identical, but excluded
 
-    let opts = WalkOptions {
+    let opts = ScanOptions {
         exclude: globs(&["**/skip/**"]),
         ..Default::default()
     };
@@ -224,11 +224,11 @@ fn follow_symlinks_controls_whether_linked_files_are_scanned() {
     std::os::unix::fs::symlink(external.path().join("orig"), dir.path().join("lnk")).unwrap();
 
     // Without following, the symlink is skipped: "copy" stands alone.
-    assert!(find_duplicates(dir.path(), &WalkOptions::default()).is_empty());
+    assert!(find_duplicates(dir.path(), &ScanOptions::default()).is_empty());
 
     // Following resolves the link to a real, distinct-inode file, revealing the
     // duplicate.
-    let opts = WalkOptions {
+    let opts = ScanOptions {
         follow_symlinks: true,
         ..Default::default()
     };
@@ -285,13 +285,56 @@ fn chunk_hash_drops_lonely_sizes_and_groups_by_prefix() {
     write(dir.path(), "diff", b"different"); // size 9, different content
     write(dir.path(), "unique", b"a-size-of-its-own"); // lone size
 
-    let chunks = chunk_hash(buckets(dir.path()));
+    let chunks = chunk_hash(buckets(dir.path()), Sample::Start);
 
     // The lone-size file is never hashed; the two identical files share a
     // (size, chunk-hash) bucket, the odd one out sits alone.
     assert_eq!(total(&chunks), 3);
     assert_eq!(bucket_lens(&chunks), vec![1, 2]);
     assert!(chunks.keys().all(|(size, _)| *size == 9));
+}
+
+// ---- sample strategy -------------------------------------------------------
+
+#[test]
+fn sample_strategy_changes_which_bytes_are_read() {
+    // Two same-size files that are identical except for a single byte at the
+    // exact center. The prefix (and suffix) are byte-for-byte the same.
+    let dir = tempdir().unwrap();
+    let size = 512 * 1024;
+    let mut a = vec![0u8; size];
+    let mut b = vec![0u8; size];
+    a[size / 2] = 1;
+    b[size / 2] = 2;
+    write(dir.path(), "a", &a);
+    write(dir.path(), "b", &b);
+
+    // Sampling the start reads the identical prefix, so they collide...
+    let start = chunk_hash(buckets(dir.path()), Sample::Start);
+    assert_eq!(bucket_lens(&start), vec![2]);
+
+    // ...but sampling the middle reads the differing center byte and splits them.
+    let middle = chunk_hash(buckets(dir.path()), Sample::Middle);
+    assert_eq!(bucket_lens(&middle), vec![1, 1]);
+}
+
+#[test]
+fn duplicates_are_found_under_every_sample_strategy() {
+    // Sampling location is a performance knob — it must never change results.
+    for sample in [Sample::Start, Sample::Middle, Sample::End] {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "a", b"the very same contents");
+        write(dir.path(), "b", b"the very same contents");
+        write(dir.path(), "c", b"something else entirely");
+
+        let opts = ScanOptions {
+            sample,
+            ..Default::default()
+        };
+        let groups = find_duplicates(dir.path(), &opts);
+        assert_eq!(groups.len(), 1, "strategy {sample:?}");
+        assert_eq!(names(&groups), vec![vec!["a".to_string(), "b".to_string()]]);
+    }
 }
 
 // ---- confirm_by_full_hash (pass 3) -----------------------------------------
@@ -305,7 +348,7 @@ fn confirm_by_full_hash_splits_prefix_collisions() {
     write(dir.path(), "c", &a); // true duplicate of a
 
     // All three collide in the chunk pass (identical leading chunk)...
-    let chunks = chunk_hash(buckets(dir.path()));
+    let chunks = chunk_hash(buckets(dir.path()), Sample::Start);
     assert_eq!(bucket_lens(&chunks), vec![3]);
 
     // ...but the full hash separates b out, leaving a+c together.
@@ -329,7 +372,7 @@ fn assemble_groups_drops_singletons_and_orders_by_size() {
     write(dir.path(), "lonely1", &a);
     write(dir.path(), "lonely2", &b);
 
-    let by_hash = confirm_by_full_hash(chunk_hash(buckets(dir.path())));
+    let by_hash = confirm_by_full_hash(chunk_hash(buckets(dir.path()), Sample::Start));
     // Sanity check the input actually contains singletons to drop.
     assert!(bucket_lens(&by_hash).contains(&1));
 

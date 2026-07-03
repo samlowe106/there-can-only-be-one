@@ -5,9 +5,10 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+use clap::ValueEnum;
 use globset::GlobSet;
 use rayon::prelude::*;
 use walkdir::{DirEntry, WalkDir};
@@ -46,22 +47,44 @@ impl FileInfo {
     }
 }
 
-/// Options controlling the filesystem walk in [`bucket_by_size`].
-pub struct WalkOptions {
+/// Where in each file the chunk-hash pass samples its bytes.
+///
+/// Sampling the start is cheapest (a sequential read), but files that share a
+/// large fixed prefix — format headers, zero-padded or preallocated images —
+/// collide there and fall through to the full-hash pass. Sampling the middle or
+/// end skips such prefixes and can prune better, at the cost of a seek. The
+/// choice never changes *which* duplicates are found, only how much data gets
+/// fully hashed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum Sample {
+    /// The first bytes of the file (default).
+    #[default]
+    Start,
+    /// A window centered in the file.
+    Middle,
+    /// The last bytes of the file.
+    End,
+}
+
+/// Options controlling a scan.
+pub struct ScanOptions {
     /// Follow symbolic links while walking (default: `false`).
     pub follow_symlinks: bool,
     /// Ignore files smaller than this many bytes (default: `0`).
     pub min_size: u64,
     /// Skip any path matching this glob set (default: matches nothing).
     pub exclude: GlobSet,
+    /// Where the chunk-hash pass samples each file (default: [`Sample::Start`]).
+    pub sample: Sample,
 }
 
-impl Default for WalkOptions {
+impl Default for ScanOptions {
     fn default() -> Self {
         Self {
             follow_symlinks: false,
             min_size: 0,
             exclude: GlobSet::empty(),
+            sample: Sample::Start,
         }
     }
 }
@@ -78,9 +101,9 @@ pub struct DupGroup {
 ///
 /// Unreadable files and directory-walk errors are reported to stderr and
 /// skipped rather than aborting the whole scan.
-pub fn find_duplicates(root: &Path, opts: &WalkOptions) -> Vec<DupGroup> {
+pub fn find_duplicates(root: &Path, opts: &ScanOptions) -> Vec<DupGroup> {
     let size_buckets = bucket_by_size(root, opts);
-    let chunk_buckets = chunk_hash(size_buckets);
+    let chunk_buckets = chunk_hash(size_buckets, opts.sample);
     let by_hash = confirm_by_full_hash(chunk_buckets);
     assemble_groups(by_hash)
 }
@@ -118,7 +141,7 @@ pub fn duplicate_files(groups: &[DupGroup]) -> usize {
 /// identity (see [`crate::platform`]): only one name survives per physical
 /// file, so we never report two names for the same bytes (which waste no
 /// disk). Walk errors and unreadable files are logged and skipped.
-pub fn bucket_by_size(root: &Path, opts: &WalkOptions) -> HashMap<u64, Vec<FileInfo>> {
+pub fn bucket_by_size(root: &Path, opts: &ScanOptions) -> HashMap<u64, Vec<FileInfo>> {
     WalkDir::new(root)
         .follow_links(opts.follow_symlinks)
         .into_iter()
@@ -158,21 +181,26 @@ fn file_info(entry: DirEntry) -> Option<(Option<PhysicalId>, FileInfo)> {
 }
 
 /// Pass 2: chunk-hash every file that shares its size with another, in
-/// parallel, then group by (size, chunk-hash) — same size *and* same leading
-/// bytes are the only real duplicate candidates. If a file is no larger than
-/// its chunk, this hash already covers the whole file, so pass 3 can reuse it.
+/// parallel, then group by (size, chunk-hash) — same size *and* same sampled
+/// bytes (see [`Sample`]) are the only real duplicate candidates. If a file is
+/// no larger than its chunk, this hash covers the whole file (the sample always
+/// starts at offset 0 in that case), so pass 3 can reuse it.
 pub fn chunk_hash(
     size_buckets: HashMap<u64, Vec<FileInfo>>,
+    sample: Sample,
 ) -> HashMap<(u64, blake3::Hash), Vec<FileInfo>> {
     size_buckets
         .into_par_iter()
         .filter(|(_, v)| v.len() > 1)
         .flat_map(|(_, v)| v)
-        .filter_map(|info| match hash_file(&info.path, info.chunk_size) {
-            Ok(hash) => Some((hash, info)),
-            Err(e) => {
-                eprintln!("warning: cannot read {}: {e}", info.path.display());
-                None
+        .filter_map(|info| {
+            let offset = sample_offset(sample, info.size, info.chunk_size);
+            match hash_region(&info.path, offset, info.chunk_size) {
+                Ok(hash) => Some((hash, info)),
+                Err(e) => {
+                    eprintln!("warning: cannot read {}: {e}", info.path.display());
+                    None
+                }
             }
         })
         .collect::<Vec<_>>()
@@ -197,7 +225,7 @@ pub fn confirm_by_full_hash(
             let full = if info.size <= info.chunk_size {
                 Some(chunk_hash) // the chunk pass already read the whole file
             } else {
-                hash_file(&info.path, u64::MAX)
+                hash_region(&info.path, 0, u64::MAX)
                     .map_err(|e| eprintln!("warning: cannot read {}: {e}", info.path.display()))
                     .ok()
             };
@@ -234,11 +262,27 @@ pub fn assemble_groups(by_hash: HashMap<blake3::Hash, Vec<FileInfo>>) -> Vec<Dup
     groups
 }
 
-/// Hash up to `limit` bytes from the start of `path` with BLAKE3.
-/// Pass `u64::MAX` to hash the entire file.
-fn hash_file(path: &Path, limit: u64) -> io::Result<blake3::Hash> {
+/// Hash `len` bytes starting at `offset` in `path` with BLAKE3. Pass
+/// `len == u64::MAX` to hash through to the end of the file.
+fn hash_region(path: &Path, offset: u64, len: u64) -> io::Result<blake3::Hash> {
+    let mut file = File::open(path)?;
+    if offset > 0 {
+        file.seek(SeekFrom::Start(offset))?;
+    }
     let mut hasher = blake3::Hasher::new();
-    let mut reader = File::open(path)?.take(limit);
+    let mut reader = file.take(len);
     io::copy(&mut reader, &mut hasher)?;
     Ok(hasher.finalize())
+}
+
+/// The byte offset at which the chunk pass samples a file of `size`, given the
+/// `chunk` sample length and the [`Sample`] strategy. When the file is no
+/// larger than the chunk this is 0 for every strategy, so the sample covers the
+/// whole file and equals its full hash.
+fn sample_offset(sample: Sample, size: u64, chunk: u64) -> u64 {
+    match sample {
+        Sample::Start => 0,
+        Sample::Middle => size.saturating_sub(chunk) / 2,
+        Sample::End => size.saturating_sub(chunk),
+    }
 }
